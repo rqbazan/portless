@@ -28,6 +28,9 @@ import {
   resolveFrameworkBasename,
   isPortListening,
   isProxyRunning,
+  reportHostsSync,
+  triggerHostsSync,
+  syncHostsWithWarning,
   listenOnProxyInterface,
   parsePidFromNetstat,
   parseTldList,
@@ -42,7 +45,6 @@ import {
   writeTldsFile,
   writeTlsMarker,
 } from "./cli-utils.js";
-
 describe("proxy listener interface", () => {
   it("uses only IPv4 and IPv6 loopback outside LAN mode", () => {
     expect(getProxyBindTargets(false)).toEqual([
@@ -2005,5 +2007,186 @@ describe("readPersistedProxyState", () => {
       tlds: ["local"],
       lanMode: true,
     });
+  });
+
+  it("does not infer LAN mode from a custom local TLD", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    fs.writeFileSync(path.join(tmpDir, "proxy.tld"), "local");
+    expect(readPersistedProxyState()).toMatchObject({
+      tlds: ["local"],
+      lanMode: false,
+    });
+  });
+});
+
+// Issue #364: the automatic sync ignored its result, so an unprivileged run
+// registered a route, skipped the hosts block and said nothing. The sync runs in
+// the detached daemon whose stdio goes to proxy.log, so the answer has to cross a
+// process boundary. It crosses on the request that asked for it, which is what
+// lets the outcome carry no timestamp, no owner and no schema version: a response
+// cannot be stale, cannot belong to another caller, and cannot be left behind by
+// a previous daemon.
+describe("reportHostsSync", () => {
+  const warnings: string[] = [];
+  const onWarn = (m: string) => warnings.push(m);
+  const acted = async (): Promise<"acted"> => "acted";
+  const mute = async (): Promise<"mute"> => "mute";
+  const absent = async (): Promise<"absent"> => "absent";
+  const disabled = async (): Promise<"disabled"> => "disabled";
+
+  beforeEach(() => {
+    warnings.length = 0;
+  });
+
+  it("says nothing when the hostname already resolves", async () => {
+    await reportHostsSync(["a.localhost"], 1, false, false, onWarn, acted, async () => true);
+    expect(warnings).toEqual([]);
+  });
+
+  it("does not warn when the system resolver selects IPv6 loopback", async () => {
+    await reportHostsSync(["::1"], 1, false, false, onWarn, acted);
+    expect(warnings).toEqual([]);
+  });
+
+  it("warns when the system resolver selects non-loopback IPv6", async () => {
+    await reportHostsSync(["2001:db8::1"], 1, false, false, onWarn, acted);
+    expect(warnings).toEqual(["2001:db8::1 will not resolve. Run: portless hosts sync"]);
+  });
+
+  it("warns naming only the hostnames that do not resolve", async () => {
+    await reportHostsSync(
+      ["good.test", "bad.test"],
+      1,
+      false,
+      false,
+      onWarn,
+      acted,
+      async (hostname) => hostname === "good.test",
+      50
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("bad.test");
+    expect(warnings[0]).not.toContain("good.test");
+  });
+
+  it("gives an older daemon its watcher window", async () => {
+    let reads = 0;
+    await reportHostsSync(
+      ["a.test"],
+      1,
+      false,
+      false,
+      onWarn,
+      mute,
+      async () => true,
+      2000,
+      () => (++reads >= 3 ? ["a.test"] : [])
+    );
+    expect(reads).toBeGreaterThan(1);
+    expect(warnings).toEqual([]);
+  });
+
+  it("warns at the ceiling when an older daemon never syncs", async () => {
+    const started = Date.now();
+    await reportHostsSync(
+      ["a.test"],
+      1,
+      false,
+      false,
+      onWarn,
+      mute,
+      async () => false,
+      150,
+      () => []
+    );
+    expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("does not wait when no producer exists", async () => {
+    const started = Date.now();
+    await reportHostsSync(["a.test"], 1, false, false, onWarn, absent, async () => false, 3000);
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("does not wait when hosts sync is disabled", async () => {
+    const started = Date.now();
+    await reportHostsSync(["a.test"], 1, false, false, onWarn, disabled, async () => false, 3000);
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("checks custom .local names outside LAN mode", async () => {
+    let asked = 0;
+    await reportHostsSync(["app.local"], 1, false, false, onWarn, acted, async () => {
+      asked += 1;
+      return false;
+    });
+    expect(asked).toBe(1);
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("skips .local names in active LAN mode", async () => {
+    let triggered = false;
+    await reportHostsSync(["app.local"], 1, false, true, onWarn, async () => {
+      triggered = true;
+      return "acted";
+    });
+    expect(triggered).toBe(false);
+    expect(warnings).toEqual([]);
+  });
+});
+
+describe("triggerHostsSync", () => {
+  it("reports absent when nothing is listening", async () => {
+    expect(await triggerHostsSync(19899)).toBe("absent");
+  });
+});
+
+describe("syncHostsWithWarning", () => {
+  // This latch bounds the daemon's own proxy.log on repeated route reloads. It
+  // never bounds what users are told: delivery is per request, so each
+  // registering CLI gets its own answer even while this is latched.
+  it("warns once and stays quiet while the sync keeps failing", () => {
+    let warns = 0;
+    const fail = () => false;
+    let latched = syncHostsWithWarning(["a.localhost"], false, () => warns++, fail);
+    expect(warns).toBe(1);
+    latched = syncHostsWithWarning(["a.localhost"], latched, () => warns++, fail);
+    expect(warns).toBe(1);
+    expect(latched).toBe(true);
+  });
+
+  it("re-arms after a success so a later failure warns again", () => {
+    let warns = 0;
+    const latched = syncHostsWithWarning(
+      ["a.localhost"],
+      true,
+      () => warns++,
+      () => true
+    );
+    expect(latched).toBe(false);
+    syncHostsWithWarning(
+      ["a.localhost"],
+      latched,
+      () => warns++,
+      () => false
+    );
+    expect(warns).toBe(1);
+  });
+
+  // The startup warm-up runs with no routes. If its failure spent the latch, the
+  // first real route's failure would find it already gone and log nothing.
+  it("does not let an empty warm-up sync consume the latch", () => {
+    let warns = 0;
+    const latched = syncHostsWithWarning(
+      [],
+      false,
+      () => warns++,
+      () => false
+    );
+    expect(warns).toBe(0);
+    expect(latched).toBe(false);
   });
 });

@@ -5,6 +5,13 @@ import * as net from "node:net";
 import type { ProxyServerOptions, RouteInfo } from "./types.js";
 import { createLoopbackConnection, escapeHtml, formatUrl } from "./utils.js";
 import { ARROW_SVG, renderPage } from "./pages.js";
+import {
+  HOSTS_SYNC_AUTH_CHALLENGE_HEADER,
+  HOSTS_SYNC_AUTH_HEADER,
+  HOSTS_SYNC_AUTH_PROOF_HEADER,
+  createHostsSyncProof,
+  isValidHostsSyncToken,
+} from "./hosts-sync-auth.js";
 
 /** Response header used to identify a portless proxy (for health checks). */
 export const PORTLESS_HEADER = "X-Portless";
@@ -45,6 +52,76 @@ function getRequestHost(req: http.IncomingMessage): string {
  */
 function isEncrypted(req: http.IncomingMessage): boolean {
   return !!(req.socket as net.Socket & { encrypted?: boolean }).encrypted;
+}
+
+export const HOSTS_SYNC_PATH = "/.portless/hosts-sync";
+
+function isLoopbackPeer(address: string | undefined): boolean {
+  if (!address) return false;
+  const bare = address.startsWith("::ffff:") ? address.slice("::ffff:".length) : address;
+  return bare === "::1" || bare.startsWith("127.");
+}
+
+function hasValidPort(authority: string, hostname: string): boolean {
+  if (authority === hostname) return true;
+  const port = authority.slice(hostname.length + 1);
+  return /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
+}
+
+function isLoopbackAuthority(authority: string): boolean {
+  if (authority === "127.0.0.1" || authority === "[::1]") return true;
+  if (authority.startsWith("127.0.0.1:")) return hasValidPort(authority, "127.0.0.1");
+  if (authority.startsWith("[::1]:")) return hasValidPort(authority, "[::1]");
+  return false;
+}
+
+function getSingleRawHeader(req: http.IncomingMessage, name: string): string | null {
+  const values = req.rawHeaders.reduce<string[]>((matches, value, index) => {
+    if (index % 2 === 0 && value.toLowerCase() === name) {
+      matches.push(req.rawHeaders[index + 1] ?? "");
+    }
+    return matches;
+  }, []);
+  return values.length === 1 ? values[0] : null;
+}
+
+function handleHostsSyncRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  onHostsSyncRequest: (() => "acted" | "disabled") | undefined,
+  hostsSyncToken: string | undefined
+): void {
+  if (!isLoopbackPeer(req.socket.remoteAddress)) {
+    res.writeHead(403, { "Content-Type": "text/plain" });
+    res.end("Forbidden");
+    return;
+  }
+  const suppliedToken = getSingleRawHeader(req, HOSTS_SYNC_AUTH_HEADER);
+  const authorized =
+    req.headers.origin === undefined &&
+    req.headers["sec-fetch-site"] === undefined &&
+    suppliedToken !== null &&
+    isValidHostsSyncToken(suppliedToken) &&
+    typeof hostsSyncToken === "string" &&
+    isValidHostsSyncToken(hostsSyncToken) &&
+    crypto.timingSafeEqual(Buffer.from(suppliedToken), Buffer.from(hostsSyncToken));
+  if (!authorized) {
+    res.writeHead(401, { "Content-Type": "text/plain" });
+    res.end("Unauthorized");
+    return;
+  }
+  if (!onHostsSyncRequest) {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not Found");
+    return;
+  }
+  if (onHostsSyncRequest() === "disabled") {
+    res.writeHead(409, { "Content-Type": "text/plain" });
+    res.end("Hosts sync disabled");
+    return;
+  }
+  res.writeHead(204);
+  res.end();
 }
 
 /**
@@ -187,6 +264,8 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     tlds = [tld],
     strict = true,
     onError = (msg: string) => console.error(msg),
+    onHostsSyncRequest,
+    hostsSyncToken,
     tls,
   } = options;
   const tldSuffixes = [...new Set(tlds.length > 0 ? tlds : [tld])].map((value) => `.${value}`);
@@ -195,9 +274,36 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
     const reqTls = isEncrypted(req);
     res.setHeader(PORTLESS_HEADER, "1");
+    const rawHost = getRequestHost(req);
+    if (hostsSyncToken && isValidHostsSyncToken(hostsSyncToken)) {
+      const challenge = getSingleRawHeader(req, HOSTS_SYNC_AUTH_CHALLENGE_HEADER);
+      const proof =
+        req.method === "HEAD" &&
+        req.url === "/" &&
+        isLoopbackPeer(req.socket.remoteAddress) &&
+        isLoopbackAuthority(rawHost.toLowerCase()) &&
+        req.headers.origin === undefined &&
+        req.headers["sec-fetch-site"] === undefined &&
+        challenge !== null
+          ? createHostsSyncProof(hostsSyncToken, challenge)
+          : null;
+      if (proof) {
+        res.setHeader(HOSTS_SYNC_AUTH_PROOF_HEADER, proof);
+        res.setHeader("Cache-Control", "no-store");
+      }
+    }
 
     const routes = getRoutes();
-    const rawHost = getRequestHost(req);
+
+    if (
+      req.method === "POST" &&
+      req.url === HOSTS_SYNC_PATH &&
+      isLoopbackAuthority(rawHost.toLowerCase())
+    ) {
+      handleHostsSyncRequest(req, res, onHostsSyncRequest, hostsSyncToken);
+      return;
+    }
+
     const host = rawHost.split(":")[0];
     const url = req.url || "/";
 

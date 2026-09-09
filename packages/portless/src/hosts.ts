@@ -7,6 +7,7 @@ const isWindows = process.platform === "win32";
 const HOSTS_PATH = isWindows
   ? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "drivers", "etc", "hosts")
   : "/etc/hosts";
+const LOOPBACK_ADDRESS = "127.0.0.1";
 const MARKER_START = "# portless-start";
 const MARKER_END = "# portless-end";
 
@@ -56,7 +57,7 @@ export function removeBlock(content: string): string {
  */
 export function buildBlock(hostnames: string[]): string {
   if (hostnames.length === 0) return "";
-  const entries = hostnames.map((h) => `127.0.0.1 ${h}`).join("\n");
+  const entries = hostnames.map((h) => `${LOOPBACK_ADDRESS} ${h}`).join("\n");
   return `${MARKER_START}\n${entries}\n${MARKER_END}`;
 }
 
@@ -69,25 +70,53 @@ export function shouldAutoSyncHosts(syncVal: string | undefined): boolean {
 }
 
 /**
- * Sync /etc/hosts to include entries for all given hostnames.
- * Replaces any existing portless-managed block. Requires root access.
- * Returns true on success, false on failure.
+ * Whether the managed block is exactly these hostnames, no others, each on
+ * loopback. Exactness, not coverage: a superset means a removed route's entry is
+ * still resolving. Pure so it is testable without the hosts path.
+ */
+export function blockMatchesHostnames(content: string, hostnames: string[]): boolean {
+  const lines = extractManagedBlock(content);
+  const wanted = new Set(hostnames);
+  if (wanted.size !== hostnames.length) return false;
+  const seen = new Set<string>();
+  for (const line of lines) {
+    const tokens = line.split("#", 1)[0].trim().split(/\s+/);
+    const [address, ...aliases] = tokens;
+    if (address !== LOOPBACK_ADDRESS || aliases.length === 0) return false;
+    for (const hostname of aliases) {
+      if (!wanted.has(hostname) || seen.has(hostname)) return false;
+      seen.add(hostname);
+    }
+  }
+  return seen.size === wanted.size;
+}
+
+/**
+ * Rewrite the managed block to exactly these hostnames. Needs privilege.
+ *
+ * Returns whether the block matches afterwards, which is the writer's question.
+ * Whether some hostname resolves is a weaker, different question: use
+ * `checkHostResolution`, since a hosts entry is only one reason a name resolves.
+ *
+ * Skips the write when the block already matches, so a no-op reload does not
+ * rewrite the file.
  */
 export function syncHostsFile(hostnames: string[]): boolean {
+  const content = readHostsFile();
+  if (blockMatchesHostnames(content, hostnames)) return true;
   try {
-    const content = readHostsFile();
     const cleaned = removeBlock(content);
-
     if (hostnames.length === 0) {
       fs.writeFileSync(HOSTS_PATH, cleaned);
     } else {
       const block = buildBlock(hostnames);
       fs.writeFileSync(HOSTS_PATH, cleaned.trimEnd() + "\n\n" + block + "\n");
     }
-    return true;
   } catch {
     return false;
   }
+  // Re-read rather than assume the write landed.
+  return blockMatchesHostnames(readHostsFile(), hostnames);
 }
 
 /**
@@ -110,26 +139,24 @@ export function cleanHostsFile(): boolean {
  */
 export function getManagedHostnames(): string[] {
   const content = readHostsFile();
-  return extractManagedBlock(content)
-    .map((line) => {
-      const parts = line.split(/\s+/);
-      return parts.length >= 2 ? parts[1] : "";
-    })
-    .filter(Boolean);
+  return extractManagedBlock(content).flatMap((line) => {
+    const [, ...aliases] = line.split("#", 1)[0].trim().split(/\s+/);
+    return aliases;
+  });
 }
 
 /**
- * Check whether a hostname resolves to 127.0.0.1 via the system DNS resolver.
- * Returns true if resolution works, false otherwise.
+ * Check whether the system DNS resolver selects an address where the local
+ * proxy listens.
  */
 export function checkHostResolution(hostname: string): Promise<boolean> {
   return new Promise((resolve) => {
-    dns.lookup(hostname, { family: 4 }, (err, address) => {
+    dns.lookup(hostname, (err, address) => {
       if (err) {
         resolve(false);
         return;
       }
-      resolve(address === "127.0.0.1");
+      resolve(address === "127.0.0.1" || address === "::1");
     });
   });
 }

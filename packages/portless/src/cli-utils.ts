@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
@@ -6,9 +7,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { execFileSync, execSync, spawn } from "node:child_process";
-import { PORTLESS_HEADER } from "./proxy.js";
+import { HOSTS_SYNC_PATH, PORTLESS_HEADER } from "./proxy.js";
+import { checkHostResolution, getManagedHostnames, syncHostsFile } from "./hosts.js";
 import { resolveScript, resolveScriptRaw } from "./config.js";
 import { createLoopbackConnection, resolveUserHome } from "./utils.js";
+import {
+  HOSTS_SYNC_AUTH_CHALLENGE_HEADER,
+  HOSTS_SYNC_AUTH_HEADER,
+  HOSTS_SYNC_AUTH_PROOF_HEADER,
+  createHostsSyncProof,
+  generateHostsSyncChallenge,
+  isValidHostsSyncToken,
+  readHostsSyncToken,
+} from "./hosts-sync-auth.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -622,7 +633,7 @@ export function readPersistedProxyState(): {
     const tlds = readTldsFromDir(dir);
     const tld = tlds[0] ?? DEFAULT_TLD;
     const lanIp = readLanMarker(dir);
-    return { port, tls, tld, tlds, lanMode: lanIp !== null || tlds.includes("local") };
+    return { port, tls, tld, tlds, lanMode: lanIp !== null };
   }
 
   return null;
@@ -722,7 +733,7 @@ export async function discoverState(): Promise<{
         tls,
         tld,
         tlds,
-        lanMode: lanIp !== null || tlds.includes("local"),
+        lanMode: lanIp !== null,
         lanIp,
       };
     }
@@ -756,7 +767,7 @@ export async function discoverState(): Promise<{
         tls,
         tld,
         tlds,
-        lanMode: lanIp !== null || tlds.includes("local"),
+        lanMode: lanIp !== null,
         lanIp,
       };
     }
@@ -777,7 +788,7 @@ export async function discoverState(): Promise<{
         tls,
         tld,
         tlds,
-        lanMode: lanIp !== null || tlds.includes("local"),
+        lanMode: lanIp !== null,
         lanIp,
       };
     }
@@ -804,7 +815,7 @@ export async function discoverState(): Promise<{
         tls,
         tld,
         tlds,
-        lanMode: lanIp !== null || tlds.includes("local"),
+        lanMode: lanIp !== null,
         lanIp,
       };
     }
@@ -903,6 +914,173 @@ export function isProxyRunning(port: number, tls = false): Promise<boolean> {
     });
     req.end();
   });
+}
+
+/** Display name for the hosts file in user-facing text. */
+export const HOSTS_DISPLAY = process.platform === "win32" ? "hosts file" : "/etc/hosts";
+
+export function hostsUnresolvedMessage(hostnames: string[]): string {
+  return `${hostnames.join(", ")} will not resolve. Run: portless hosts sync`;
+}
+
+const HOSTS_SYNC_TRIGGER_TIMEOUT_MS = 500;
+const UNTRIGGERED_SYNC_CEILING_MS = 3500;
+
+export type HostsSyncTrigger = "acted" | "absent" | "disabled" | "mute";
+
+function probeHostsSyncAuth(
+  port: number,
+  tls: boolean,
+  token: string | null,
+  challenge: string,
+  signal: AbortSignal
+): Promise<"available" | "absent" | "mute"> {
+  return new Promise((resolve) => {
+    const requestFn = tls ? https.request : http.request;
+    const req = requestFn(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: "/",
+        method: "HEAD",
+        headers: { [HOSTS_SYNC_AUTH_CHALLENGE_HEADER]: challenge },
+        signal,
+        ...(tls ? { rejectUnauthorized: false } : {}),
+      },
+      (res) => {
+        const expectedProof = token ? createHostsSyncProof(token, challenge) : null;
+        const suppliedProof = res.headers[HOSTS_SYNC_AUTH_PROOF_HEADER];
+        const available =
+          res.headers[PORTLESS_HEADER.toLowerCase()] === "1" &&
+          typeof suppliedProof === "string" &&
+          expectedProof !== null &&
+          isValidHostsSyncToken(suppliedProof) &&
+          crypto.timingSafeEqual(Buffer.from(suppliedProof), Buffer.from(expectedProof));
+        res.resume();
+        res.on("end", () => resolve(available ? "available" : "mute"));
+        res.on("error", () => resolve("mute"));
+      }
+    );
+    req.on("error", (err: NodeJS.ErrnoException) => {
+      resolve(err.code === "ECONNREFUSED" || err.code === "ENOTFOUND" ? "absent" : "mute");
+    });
+    req.end();
+  });
+}
+
+export async function triggerHostsSync(
+  port: number,
+  tls = false,
+  stateDir = resolveStateDir(port)
+): Promise<HostsSyncTrigger> {
+  const signal = AbortSignal.timeout(HOSTS_SYNC_TRIGGER_TIMEOUT_MS);
+  const token = readHostsSyncToken(stateDir);
+  const challenge = generateHostsSyncChallenge();
+  const capability = await probeHostsSyncAuth(port, tls, token, challenge, signal);
+  if (capability !== "available") return capability;
+  if (!token) return Promise.resolve("mute");
+  return new Promise((resolve) => {
+    const requestFn = tls ? https.request : http.request;
+    const req = requestFn(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: HOSTS_SYNC_PATH,
+        method: "POST",
+        headers: { [HOSTS_SYNC_AUTH_HEADER]: token },
+        signal,
+        ...(tls ? { rejectUnauthorized: false } : {}),
+      },
+      (res) => {
+        const result =
+          res.statusCode === 204 ? "acted" : res.statusCode === 409 ? "disabled" : "mute";
+        res.resume();
+        res.on("end", () => resolve(result));
+        res.on("error", () => resolve("mute"));
+      }
+    );
+    req.on("error", (err: NodeJS.ErrnoException) => {
+      resolve(err.code === "ECONNREFUSED" || err.code === "ENOTFOUND" ? "absent" : "mute");
+    });
+    req.end();
+  });
+}
+
+/**
+ * Warn if a route hostname will not resolve. Issue #364.
+ *
+ * Reports resolution, not whether the file was written. `.localhost` resolves
+ * without a hosts entry on current macOS and glibc (RFC 6761 says SHOULD), so a
+ * skipped write there is invisible; a custom TLD resolves on neither.
+ *
+ * Waits by reading the hosts file, not by re-querying the resolver, because a
+ * negative lookup can be cached and a name that is about to resolve would stay
+ * negative.
+ */
+export async function reportHostsSync(
+  hostnames: string[],
+  port: number,
+  tls: boolean,
+  lanMode: boolean,
+  onWarn: (message: string) => void,
+  trigger: (port: number, tls: boolean) => Promise<HostsSyncTrigger> = triggerHostsSync,
+  resolves: (hostname: string) => Promise<boolean> = checkHostResolution,
+  ceilingMs = UNTRIGGERED_SYNC_CEILING_MS,
+  readManaged: () => string[] = getManagedHostnames
+): Promise<void> {
+  const managed = lanMode
+    ? hostnames.filter((hostname) => !hostname.endsWith(".local"))
+    : hostnames;
+  if (managed.length === 0) return;
+  const found = await trigger(port, tls);
+
+  const unresolved = async () => {
+    const checked = await Promise.all(managed.map((hostname) => resolves(hostname)));
+    return managed.filter((_, i) => !checked[i]);
+  };
+
+  if (found !== "mute") {
+    const missing = await unresolved();
+    if (missing.length > 0) onWarn(hostsUnresolvedMessage(missing));
+    return;
+  }
+
+  const deadline = Date.now() + ceilingMs;
+  while (Date.now() < deadline) {
+    const written = new Set(readManaged());
+    if (managed.every((hostname) => written.has(hostname))) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  const missing = await unresolved();
+  if (missing.length > 0) onWarn(hostsUnresolvedMessage(missing));
+}
+
+/**
+ * Run a hosts-file sync and emit a one-time warning when it fails, so a daemon
+ * that cannot write does not fill its log with the same line on every route
+ * reload.
+ *
+ * This governs the daemon's own log only. Delivery to users is per request, so
+ * this latch cannot silence anyone: several apps registering against the same
+ * failing daemon are each told, which an earlier one-shot design got wrong.
+ *
+ * Returns the next "already warned" state, which the caller threads back in: a
+ * failed sync latches it, a successful one re-arms it. An empty-route sync (the
+ * warm-up at startup, or all routes removed) has nothing user-visible to write,
+ * so its failure must not consume the latch, or the first real route's failure
+ * finds it already spent.
+ */
+export function syncHostsWithWarning(
+  hostnames: string[],
+  alreadyWarned: boolean,
+  onWarn: () => void,
+  sync: (hostnames: string[]) => boolean = syncHostsFile
+): boolean {
+  if (sync(hostnames)) return false;
+  if (hostnames.length === 0) return alreadyWarned;
+  if (!alreadyWarned) onWarn();
+  return true;
 }
 
 /** Check whether any process is listening on the given port on either loopback family. */
